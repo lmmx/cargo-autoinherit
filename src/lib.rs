@@ -399,8 +399,8 @@ fn inherit_deps(
                         name,
                         toml_edit::Item::Value(inherited.into()),
                     );
-                    *was_modified = true;
                 }
+                *was_modified = true;
             }
             Dependency::Inherited(_) => {
                 // Nothing to do.
