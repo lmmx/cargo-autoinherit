@@ -25,41 +25,58 @@ pub struct AutoInheritConf {
     /// none exist, exiting with a non-zero exit code if any are found.
     #[arg(long, group = "mode")]
     pub check: bool,
+    /// Allow dependencies with multiple incompatible sources
+    ///
+    /// If not allowed, dependencies with multiple incompatible sources will cause a
+    /// non-zero exit code in check mode.
+    #[arg(long)]
+    pub allow_multiple_sources: bool,
 }
 
 #[derive(Debug, Default)]
 struct AutoInheritMetadata {
     exclude_members: Vec<String>,
+    allow_multiple_sources: bool,
 }
 
 impl AutoInheritMetadata {
     fn from_workspace(workspace: &Workspace<toml::Table>) -> Result<Self, anyhow::Error> {
-        fn error() -> anyhow::Error {
-            anyhow!("Excpected value of `exclude` in `workspace.metadata.cargo-autoinherit` to be an array of strings")
-        }
-
-        let Some(exclude) = workspace
+        let cargo_autoinherit = workspace
             .metadata
             .as_ref()
             .and_then(|m| m.get("cargo-autoinherit"))
-            .and_then(|v| v.as_table())
-            .and_then(|t| t.get("exclude-members").or(t.get("exclude_members")))
-        else {
-            return Ok(Self::default());
-        };
+            .and_then(|v| v.as_table());
 
-        let exclude: Vec<String> = match exclude {
-            toml::Value::Array(excluded) => excluded
-                .iter()
-                .map(|v| v.as_str().ok_or_else(error).map(|s| s.to_string()))
-                .try_fold(Vec::with_capacity(excluded.len()), |mut res, item| {
-                    res.push(item?);
-                    Ok::<_, anyhow::Error>(res)
-                })?,
-            _ => return Err(error()),
-        };
+        let exclude = cargo_autoinherit
+            .and_then(|t| t.get("exclude-members").or(t.get("exclude_members")))
+            .map(|v| match v {
+                toml::Value::Array(excluded) => excluded
+                    .iter()
+                    .map(|v| v.as_str()
+                        .ok_or_else(|| anyhow!("Expected value in `exclude-members` to be a string"))
+                        .map(|s| s.to_string())
+                    )
+                    .try_fold(Vec::with_capacity(excluded.len()), |mut res, item| {
+                        res.push(item?);
+                        Ok::<_, anyhow::Error>(res)
+                    }),
+                _ => Err(anyhow!("Expected value of `exclude-members` in `workspace.metadata.cargo-autoinherit` to be an array of strings")),
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        let allow_multiple_sources = cargo_autoinherit
+            .and_then(|t| t.get("allow-multiple-sources").or(t.get("allow_multiple_sources")))
+            .map(|v| match v {
+                toml::Value::Boolean(b) => Ok(*b),
+                _ => Err(anyhow!("Expected value of `allow-multiple-sources` in `workspace.metadata.cargo-autoinherit` to be a boolean")),
+            })
+            .transpose()?
+            .unwrap_or(false);
+
         Ok(Self {
             exclude_members: exclude,
+            allow_multiple_sources,
         })
     }
 }
@@ -155,6 +172,10 @@ pub fn auto_inherit(conf: AutoInheritConf) -> Result<ExitCode, anyhow::Error> {
             .chain(autoinherit_metadata.exclude_members),
     );
 
+    // Combine CLI and metadata configs, with CLI taking precedence
+    let allow_multiple_sources =
+        conf.allow_multiple_sources || autoinherit_metadata.allow_multiple_sources;
+
     let mut package_name2specs: BTreeMap<String, Action> = BTreeMap::new();
     if let Some(deps) = &mut workspace.dependencies {
         rewrite_dep_paths_as_absolute(deps.values_mut(), workspace_root);
@@ -198,6 +219,7 @@ pub fn auto_inherit(conf: AutoInheritConf) -> Result<ExitCode, anyhow::Error> {
     }
 
     let mut package_name2inherited_source: BTreeMap<String, SharedDependency> = BTreeMap::new();
+    let mut multiple_sources_detected = false;
     'outer: for (package_name, action) in package_name2specs {
         let Action::TryInherit(specs) = action else {
             eprintln!("`{package_name}` won't be auto-inherited because it appears at least once from a source type \
@@ -209,6 +231,7 @@ pub fn auto_inherit(conf: AutoInheritConf) -> Result<ExitCode, anyhow::Error> {
             for spec in specs.into_iter() {
                 eprintln!("  - {}", spec.source);
             }
+            multiple_sources_detected = !allow_multiple_sources;
             continue 'outer;
         }
 
@@ -327,7 +350,9 @@ pub fn auto_inherit(conf: AutoInheritConf) -> Result<ExitCode, anyhow::Error> {
         }
     }
 
-    if conf.check && (workspace_was_modified || any_member_was_modified) {
+    if conf.check
+        && (workspace_was_modified || any_member_was_modified || multiple_sources_detected)
+    {
         Ok(ExitCode::FAILURE)
     } else {
         Ok(ExitCode::SUCCESS)
